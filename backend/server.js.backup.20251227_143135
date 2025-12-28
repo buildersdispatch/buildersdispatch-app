@@ -1,0 +1,84 @@
+import express from "express";
+import fetch from "node-fetch";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+
+const PORT = 3000;
+
+// HEALTH CHECK
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+// CREATE HOSTED CHECKOUT SESSION
+app.post("/api/checkout", async (req, res) => {
+  try {
+    // IMPORTANT: Crossmint expects x-api-key in many flows (per docs)
+    const apiKey = process.env.CROSSMINT_API_KEY || process.env.CROSSMINT_SECRET;
+    const collectionId = process.env.CROSSMINT_COLLECTION_ID;
+
+    if (!apiKey) {
+      return res.status(500).json({ error: "Missing CROSSMINT_API_KEY (or CROSSMINT_SECRET) in .env" });
+    }
+    if (!collectionId) {
+      return res.status(500).json({ error: "Missing CROSSMINT_COLLECTION_ID in .env" });
+    }
+
+    const url = "https://staging.crossmint.com/api/2022-06-09/hosted-checkout";
+
+    const payload = {
+      lineItems: [
+        {
+          collectionId,
+          tokenId: "auto",
+          quantity: 1,
+          price: { amount: "25", currency: "USD" },
+          metadata: {
+            name: "BuildersDispatch Warranty NFT",
+            description: "Minted on purchase via Crossmint; delivered by email",
+            image: "https://buildersdispatch.com/images/genesis.png"
+          }
+        }
+      ],
+      payment: { receiptEmail: true },
+      successUrl: "https://buildersdispatch.com/success",
+      cancelUrl: "https://buildersdispatch.com/cancel"
+    };
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "x-api-key": apiKey
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const raw = await response.text();
+
+    // Return EVERYTHING so we can see what's happening
+    let json = null;
+    try { json = JSON.parse(raw); } catch {}
+
+    return res.status(200).json({
+      crossmintStatus: response.status,
+      crossmintRaw: raw,
+      crossmintJson: json,
+      checkoutUrl: json?.hostedCheckoutUrl || json?.hostedCheckoutURL || null
+    });
+
+  } catch (err) {
+    console.error("Checkout creation failed:", err);
+    return res.status(500).json({ error: "Server exception", detail: String(err) });
+  }
+});
+
+
+app.listen(PORT, () => {
+  console.log(`API running on port ${PORT}`);
+});
