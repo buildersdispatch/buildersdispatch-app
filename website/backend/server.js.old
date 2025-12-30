@@ -1,0 +1,671 @@
+require('dotenv').config();
+// BuildersDispatch Backend API
+// Main server file with Crossmint integration
+// Node.js + Express + PostgreSQL
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const { Pool } = require('pg');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const axios = require('axios');
+
+// Initialize Express
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Database connection
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  port: process.env.DB_PORT || 5432,
+  database: process.env.DB_NAME || 'buildersdispatch',
+  user: process.env.DB_USER || 'bduser',
+  password: process.env.DB_PASSWORD,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+// Crossmint API Configuration
+const CROSSMINT_CONFIG = {
+  baseURL: process.env.CROSSMINT_BASE_URL || 'https://staging.crossmint.com/api/2025-06-09',
+  serverKey: process.env.CROSSMINT_SERVER_KEY,
+  clientKey: process.env.CROSSMINT_CLIENT_KEY,
+  projectId: process.env.CROSSMINT_PROJECT_ID,
+  chainType: process.env.CROSSMINT_CHAIN_TYPE || 'evm',
+  chain: process.env.CROSSMINT_CHAIN || 'polygon-amoy',
+};
+
+// Crossmint API Client
+const crossmint = axios.create({
+  baseURL: CROSSMINT_CONFIG.baseURL,
+  headers: {
+    'Content-Type': 'application/json',
+    'X-API-KEY': CROSSMINT_CONFIG.serverKey,
+  },
+});
+
+// ======================
+// MIDDLEWARE
+// ======================
+
+app.use(helmet());
+app.use(compression());
+app.use(cors({
+  origin: process.env.CORS_ORIGIN?.split(',') || '*',
+  credentials: true,
+}));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW || 15) * 60 * 1000,
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || 100),
+  message: 'Too many requests, please try again later.',
+});
+app.use('/api/', limiter);
+
+// Request logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// Admin authorization middleware
+const requireAdmin = (req, res, next) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+};
+
+// ======================
+// CROSSMINT SERVICES
+// ======================
+
+// Create wallet for user
+async function createCrossmintWallet(email) {
+  try {
+    const response = await crossmint.post('/wallets', {
+      chainType: CROSSMINT_CONFIG.chainType,
+      config: {},
+      owner: `email:${email}`,
+    });
+    return response.data;
+  } catch (error) {
+    console.error('Crossmint wallet creation error:', error.response?.data || error.message);
+    throw new Error('Failed to create wallet: ' + (error.response?.data?.message || error.message));
+  }
+}
+
+// Mint NFT for order
+async function mintOrderNFT(order, walletAddress) {
+  try {
+    const metadata = {
+      name: `${order.product_name} - Order #${order.order_number}`,
+      description: `BuildersDispatch product purchase with ${order.warranty_years}-year warranty`,
+      image: order.product_image || 'https://buildersdispatch.com/default-nft.png',
+      attributes: [
+        { trait_type: 'Product', value: order.product_name },
+        { trait_type: 'Order Number', value: order.order_number },
+        { trait_type: 'Purchase Date', value: new Date().toISOString().split('T')[0] },
+        { trait_type: 'Warranty Years', value: order.warranty_years },
+        { trait_type: 'Warranty Expiry', value: new Date(Date.now() + order.warranty_years * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0] },
+      ],
+      properties: {
+        order_id: order.id,
+        product_id: order.product_id,
+        warranty_active: true,
+        warranty_start: new Date().toISOString(),
+        warranty_end: new Date(Date.now() + order.warranty_years * 365 * 24 * 60 * 60 * 1000).toISOString(),
+      },
+    };
+    
+    const response = await crossmint.post('/nfts', {
+      recipient: `email:${order.customer_email}`,
+      metadata,
+      chain: CROSSMINT_CONFIG.chain,
+    });
+    
+    return response.data;
+  } catch (error) {
+    console.error('NFT minting error:', error.response?.data || error.message);
+    throw new Error('Failed to mint NFT: ' + (error.response?.data?.message || error.message));
+  }
+}
+
+// Create checkout session
+async function createCheckoutSession(orderData) {
+  try {
+    const response = await crossmint.post('/orders', {
+      recipient: `email:${orderData.customerEmail}`,
+      payment: {
+        method: 'fiat',
+        currency: orderData.currency || 'usd',
+      },
+      lineItems: [{
+        metadata: {
+          name: orderData.productName,
+          description: orderData.productDescription,
+          image: orderData.productImage,
+        },
+        price: orderData.price.toString(),
+      }],
+      metadata: {
+        orderId: orderData.orderId,
+        productId: orderData.productId,
+      },
+    });
+    
+    return response.data;
+  } catch (error) {
+    console.error('Checkout creation error:', error.response?.data || error.message);
+    throw new Error('Failed to create checkout: ' + (error.response?.data?.message || error.message));
+  }
+}
+
+// ======================
+// API ROUTES
+// ======================
+
+// Health check
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      database: 'connected',
+      crossmint: CROSSMINT_CONFIG.projectId ? 'configured' : 'not configured',
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'unhealthy',
+      error: error.message,
+    });
+  }
+});
+
+// Get Crossmint client configuration (public endpoint)
+app.get('/api/crossmint/config', (req, res) => {
+  res.json({
+    clientKey: CROSSMINT_CONFIG.clientKey,
+    projectId: CROSSMINT_CONFIG.projectId,
+    chain: CROSSMINT_CONFIG.chain,
+    chainType: CROSSMINT_CONFIG.chainType,
+  });
+});
+
+// ======================
+// AUTH ROUTES
+// ======================
+
+// Register new user
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, firstName, lastName, role = 'customer' } = req.body;
+    
+    // Validate input
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
+    }
+    
+    // Check if user exists
+    const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existingUser.rows.length > 0) {
+      return res.status(409).json({ error: 'User already exists' });
+    }
+    
+    // Create Crossmint wallet
+    let walletData = null;
+    try {
+      walletData = await createCrossmintWallet(email);
+    } catch (walletError) {
+      console.error('Wallet creation failed during registration:', walletError.message);
+      // Continue without wallet - can be created later
+    }
+    
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 12);
+    
+    // Create user
+    const result = await pool.query(`
+      INSERT INTO users (email, password_hash, first_name, last_name, role, 
+                        crossmint_wallet_address, crossmint_wallet_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING id, email, first_name, last_name, role, crossmint_wallet_address
+    `, [email, passwordHash, firstName, lastName, role, 
+        walletData?.walletAddress, walletData?.walletId]);
+    
+    const user = result.rows[0];
+    
+    // Generate JWT
+    const token = jwt.sign(
+      { userId: user.id, email: user.email, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    
+    res.status(201).json({
+      message: 'User created successfully',
+      user,
+      token,
+      wallet: walletData,
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Registration failed', details: error.message });
+  }
+});
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    const result = await pool.query(`
+      SELECT id, email, password_hash, first_name, last_name, role, 
+             crossmint_wallet_address, is_active
+      FROM users WHERE email = $1
+    `, [email]);
+    
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const user = result.rows[0];
+    
+    if (!user.is_active) {
+      return res.status(403).json({ error: 'Account is disabled' });
+    }
+    
+    const validPassword = await bcrypt.compare(password, user.password_hash);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Update last login
+    await pool.query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1', [user.id]);
+    
+    const token = jwt.sign(
+      { userId: user.id, email: user.email, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    
+    delete user.password_hash;
+    
+    res.json({
+      message: 'Login successful',
+      user,
+      token,
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// ======================
+// PRODUCTS ROUTES
+// ======================
+
+// Get all products
+app.get('/api/products', async (req, res) => {
+  try {
+    const { category, status = 'active' } = req.query;
+    
+    let query = 'SELECT * FROM products WHERE is_active = true';
+    const params = [];
+    
+    if (status) {
+      query += ' AND status = $1';
+      params.push(status);
+    }
+    
+    if (category) {
+      query += ` AND category = $${params.length + 1}`;
+      params.push(category);
+    }
+    
+    query += ' ORDER BY sort_order, created_at DESC';
+    
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get products error:', error);
+    res.status(500).json({ error: 'Failed to fetch products' });
+  }
+});
+
+// Get single product
+app.get('/api/products/:slug', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM products WHERE slug = $1 AND is_active = true',
+      [req.params.slug]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Get product error:', error);
+    res.status(500).json({ error: 'Failed to fetch product' });
+  }
+});
+
+// Create product (admin only)
+app.post('/api/products', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const {
+      name, slug, description, category, basePrice, currency,
+      imageUrl, images, nftEnabled, warrantyYears, config, paymentSplit,
+      specifications, installationTimeDays
+    } = req.body;
+    
+    const result = await pool.query(`
+      INSERT INTO products (
+        name, slug, description, category, base_price, currency,
+        image_url, images, nft_enabled, warranty_years, config,
+        payment_split, specifications, installation_time_days, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      RETURNING *
+    `, [name, slug, description, category, basePrice, currency,
+        imageUrl, JSON.stringify(images), nftEnabled, warrantyYears,
+        JSON.stringify(config), JSON.stringify(paymentSplit),
+        JSON.stringify(specifications), installationTimeDays, req.user.userId]);
+    
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error('Create product error:', error);
+    res.status(500).json({ error: 'Failed to create product', details: error.message });
+  }
+});
+
+// ======================
+// ORDERS ROUTES
+// ======================
+
+// Create order and initiate Crossmint checkout
+app.post('/api/orders', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { productId, installationAddress } = req.body;
+    
+    // Get product
+    const productResult = await client.query(
+      'SELECT * FROM products WHERE id = $1 AND is_active = true',
+      [productId]
+    );
+    
+    if (productResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    
+    const product = productResult.rows[0];
+    
+    // Get user
+    const userResult = await client.query(
+      'SELECT * FROM users WHERE id = $1',
+      [req.user.userId]
+    );
+    const user = userResult.rows[0];
+    
+    // Create wallet if user doesn't have one
+    if (!user.crossmint_wallet_address) {
+      try {
+        const walletData = await createCrossmintWallet(user.email);
+        await client.query(
+          'UPDATE users SET crossmint_wallet_address = $1, crossmint_wallet_id = $2 WHERE id = $3',
+          [walletData.walletAddress, walletData.walletId, user.id]
+        );
+        user.crossmint_wallet_address = walletData.walletAddress;
+      } catch (walletError) {
+        console.error('Wallet creation error:', walletError);
+        // Continue without wallet
+      }
+    }
+    
+    // Create order
+    const orderResult = await client.query(`
+      INSERT INTO orders (
+        customer_id, customer_email, customer_wallet_address,
+        product_id, product_snapshot, subtotal, total, currency,
+        installation_address, status, payment_status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      RETURNING *
+    `, [
+      user.id, user.email, user.crossmint_wallet_address,
+      product.id, JSON.stringify(product), product.base_price,
+      product.base_price, product.currency,
+      JSON.stringify(installationAddress), 'pending', 'pending'
+    ]);
+    
+    const order = orderResult.rows[0];
+    
+    // Create Crossmint checkout session
+    const checkoutData = await createCheckoutSession({
+      customerEmail: user.email,
+      productName: product.name,
+      productDescription: product.description,
+      productImage: product.image_url,
+      price: product.base_price,
+      currency: product.currency.toLowerCase(),
+      orderId: order.id,
+      productId: product.id,
+    });
+    
+    // Update order with Crossmint order ID
+    await client.query(
+      'UPDATE orders SET crossmint_order_id = $1 WHERE id = $2',
+      [checkoutData.orderId, order.id]
+    );
+    
+    await client.query('COMMIT');
+    
+    res.status(201).json({
+      order: { ...order, crossmint_order_id: checkoutData.orderId },
+      checkout: checkoutData,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Create order error:', error);
+    res.status(500).json({ error: 'Failed to create order', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Get user's orders
+app.get('/api/orders', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC',
+      [req.user.userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Get orders error:', error);
+    res.status(500).json({ error: 'Failed to fetch orders' });
+  }
+});
+
+// Get single order
+app.get('/api/orders/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM orders WHERE id = $1 AND customer_id = $2',
+      [req.params.id, req.user.userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Get order error:', error);
+    res.status(500).json({ error: 'Failed to fetch order' });
+  }
+});
+
+// ======================
+// WEBHOOK ROUTES
+// ======================
+
+// Crossmint webhook handler
+app.post('/api/webhooks/crossmint', async (req, res) => {
+  try {
+    const event = req.body;
+    
+    // Log webhook event
+    await pool.query(
+      'INSERT INTO webhook_events (event_type, provider, provider_event_id, payload) VALUES ($1, $2, $3, $4)',
+      [event.type, 'crossmint', event.id, JSON.stringify(event)]
+    );
+    
+    // Process based on event type
+    switch (event.type) {
+      case 'payment.succeeded':
+        await handlePaymentSuccess(event);
+        break;
+      case 'payment.failed':
+        await handlePaymentFailure(event);
+        break;
+      case 'nft.minted':
+        await handleNFTMinted(event);
+        break;
+      default:
+        console.log('Unhandled webhook event:', event.type);
+    }
+    
+    res.status(200).json({ received: true });
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
+
+async function handlePaymentSuccess(event) {
+  const { orderId } = event.metadata;
+  
+  await pool.query(`
+    UPDATE orders 
+    SET payment_status = 'paid', 
+        paid_at = CURRENT_TIMESTAMP,
+        status = 'minting',
+        crossmint_payment_id = $1
+    WHERE id = $2
+  `, [event.paymentId, orderId]);
+  
+  // Trigger NFT minting
+  const orderResult = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+  const order = orderResult.rows[0];
+  
+  if (order && order.product_snapshot.nft_enabled) {
+    try {
+      const nftData = await mintOrderNFT(
+        {
+          ...order,
+          product_name: order.product_snapshot.name,
+          product_image: order.product_snapshot.image_url,
+          warranty_years: order.product_snapshot.warranty_years,
+        },
+        order.customer_wallet_address
+      );
+      
+      // NFT minting will be confirmed via webhook
+    } catch (mintError) {
+      console.error('NFT minting failed:', mintError);
+      // Update order to indicate minting failure
+      await pool.query(
+        'UPDATE orders SET status = $1 WHERE id = $2',
+        ['paid', orderId]
+      );
+    }
+  }
+}
+
+async function handlePaymentFailure(event) {
+  const { orderId } = event.metadata;
+  
+  await pool.query(`
+    UPDATE orders 
+    SET payment_status = 'failed', status = 'cancelled'
+    WHERE id = $1
+  `, [orderId]);
+}
+
+async function handleNFTMinted(event) {
+  const { orderId } = event.metadata;
+  const { tokenId, contractAddress, metadataUri } = event.nft;
+  
+  await pool.query(`
+    UPDATE orders 
+    SET nft_minted = true,
+        nft_token_id = $1,
+        nft_contract_address = $2,
+        nft_metadata_uri = $3,
+        minted_at = CURRENT_TIMESTAMP,
+        status = 'assigned'
+    WHERE id = $4
+  `, [tokenId, contractAddress, metadataUri, orderId]);
+  
+  // Create NFT record
+  const orderResult = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+  const order = orderResult.rows[0];
+  
+  if (order) {
+    await pool.query(`
+      INSERT INTO nfts (
+        token_id, contract_address, chain, owner_wallet_address,
+        owner_user_id, order_id, product_id, metadata_uri,
+        warranty_active, warranty_start_date, warranty_end_date
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_DATE, 
+                CURRENT_DATE + INTERVAL '${order.product_snapshot.warranty_years} years')
+    `, [tokenId, contractAddress, CROSSMINT_CONFIG.chain,
+        order.customer_wallet_address, order.customer_id,
+        order.id, order.product_id, metadataUri, true]);
+  }
+}
+
+// ======================
+// START SERVER
+// ======================
+
+app.listen(PORT, () => {
+  console.log(`BuildersDispatch API running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Crossmint configured: ${CROSSMINT_CONFIG.projectId ? 'Yes' : 'No'}`);
+});
+
+module.exports = app;
